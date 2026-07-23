@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # Stack-independent. Runs on every project from day one.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tests must not be modified
+        if: github.event_name == 'pull_request'
+        run: |
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- tests/ || true)
+          if [ -n "$CHANGED" ]; then
+            echo "::error::Test files modified. Frozen suite is read-only."
+            echo "$CHANGED"
+            exit 1
+          fi
+          echo "Test suite intact."
+
+      - name: Required artifacts present
+        run: |
+          MISSING=0
+          for f in docs/01-spec.md docs/03-adr.md AGENTS.md \
+                   docs/security-baseline.md docs/definition-of-done.md \
+                   docs/migrations.md docs/environments.md docs/observability.md; do
+            [ -f "$f" ] || { echo "::error::Missing $f"; MISSING=1; }
+          done
+          exit $MISSING
+
+      - name: AGENTS.md is filled in
+        run: |
+          if grep -qE "^(Language|Framework|Database|Package manager):[[:space:]]*$" AGENTS.md; then
+            echo "::error::AGENTS.md PROJECT sections not filled (Phase 3 incomplete)."
+            grep -nE "^(Language|Framework|Database|Package manager):[[:space:]]*$" AGENTS.md
+            exit 1
+          fi
+          echo "AGENTS.md configured."
+
+      - name: No secrets committed
+        run: |
+          if git ls-files | grep -E '^\.env$|^\.env\.(local|production|prod)$'; then
+            echo "::error::Env file committed."
+            exit 1
+          fi
+          echo "No env files tracked."
+
+      - name: Obvious secret patterns
+        run: |
+          # High-signal patterns only. Deliberately narrow to avoid false positives
+          # that train people to ignore this gate.
+          PAT='(AKIA[0-9A-Z]{16}|sk_live_[0-9a-zA-Z]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|xox[baprs]-[0-9A-Za-z-]{10,})'
+          if git grep -nEI "$PAT" -- . ':!*.example' ':!docs/security-baseline.md' ':!.github/workflows/ci.yml'; then
+            echo "::error::Possible secret committed."
+            exit 1
+          fi
+          echo "No secret patterns found."
+
+      - name: Migration files unchanged after first run
+        if: github.event_name == 'pull_request'
+        run: |
+          # Migrations are append-only. Modifying an existing one is a hard error;
+          # a migration that has run in staging cannot be edited.
+          MIG_DIR=$(ls -d migrations db/migrate prisma/migrations alembic/versions 2>/dev/null | head -1 || true)
+          if [ -z "$MIG_DIR" ]; then echo "No migration directory yet."; exit 0; fi
+          MODIFIED=$(git diff --diff-filter=M --name-only origin/${{ github.base_ref }}...HEAD -- "$MIG_DIR" || true)
+          if [ -n "$MODIFIED" ]; then
+            echo "::error::Existing migration modified. Migrations are append-only — add a new one."
+            echo "$MODIFIED"
+            exit 1
+          fi
+          echo "Migrations append-only."
+
+  # Phase 3: uncomment and configure for the chosen stack.
+  # test:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: ./scripts/setup.sh
+  #     - run: ./scripts/test.sh          # tests/working
+  #     - run: ./scripts/test-holdout.sh  # tests/holdout + tests/cross-feature
+  #     - run: ./scripts/lint.sh
+
+  # Phase 3: uncomment the line matching the stack. Security baseline F1.
+  # audit:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: ./scripts/audit.sh
